@@ -1,0 +1,441 @@
+# app.py
+# -------------------------------------------------------------------
+# FIAP x GoodWe – Starter (Streamlit + mock SEMS data) - v2
+# Inclui modo "Real (SEMS)" usando demo@goodwe.com / GoodweSems123!@#
+# -------------------------------------------------------------------
+import os
+import json
+from pathlib import Path
+from datetime import datetime, date, time as dtime
+import streamlit as st
+from streamlit.components.v1 import html
+from streamlit_js_eval import streamlit_js_eval
+import pandas as pd
+import plotly.express as px
+from threading import Thread
+
+
+# Módulos locais
+from ai_openai import explicar_dia
+from goodwe_client import crosslogin, get_inverter_data_by_column
+
+# Caminhos
+ROOT = Path(__file__).parent
+MOCK_PATH = ROOT / "data" / "mock_today.json"
+
+# ----------------------- Funções utilitárias ------------------------
+
+
+def carregar_mock(path: Path) -> pd.DataFrame:
+    """Carrega o arquivo JSON mock e devolve um DataFrame com datetime."""
+    if not path.exists():
+        st.error(f"Arquivo de mock não encontrado: {path}")
+        return pd.DataFrame()
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    df = pd.DataFrame(payload["data"])
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"])
+    df.attrs["meta"] = {
+        "plant_id": payload.get("plant_id"),
+        "inverter_sn": payload.get("inverter_sn"),
+        "date": payload.get("date"),
+        "timezone": payload.get("timezone"),
+        "units": payload.get("units", {})
+    }
+    return df
+
+
+def kwh(x: float) -> str:
+    return f"{x:,.2f} kWh".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def kw(x: float) -> str:
+    return f"{x:,.2f} kW".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def resumo_dia(df: pd.DataFrame) -> dict:
+    """Calcula agregados simples para a análise."""
+    if df.empty:
+        return {}
+    energia_dia = float(df["Eday"].dropna(
+    ).iloc[-1]) if "Eday" in df.columns and not df["Eday"].dropna().empty else 0.0
+    if "Pac" in df.columns and not df["Pac"].dropna().empty:
+        idx_max = df["Pac"].idxmax()
+        pico_p = float(df.loc[idx_max, "Pac"])
+        pico_h = df.loc[idx_max, "time"] if "time" in df.columns else None
+    else:
+        pico_p, pico_h = 0.0, None
+    soc_ini = int(df["Cbattery1"].dropna(
+    ).iloc[0]) if "Cbattery1" in df.columns and not df["Cbattery1"].dropna().empty else None
+    soc_fim = int(df["Cbattery1"].dropna(
+    ).iloc[-1]) if "Cbattery1" in df.columns and not df["Cbattery1"].dropna().empty else None
+    return {
+        "energia_dia": energia_dia,
+        "pico_potencia": pico_p,
+        "hora_pico": pico_h,
+        "soc_ini": soc_ini,
+        "soc_fim": soc_fim,
+    }
+
+# ------------------ Integração SEMS (básica) ------------------------
+
+
+def parse_column_timeseries(resp_json, column_name: str) -> pd.DataFrame:
+    """Extrai série temporal do formato comum do SEMS."""
+    def _parse_time(ts):
+        v = pd.to_datetime(ts, errors='coerce')
+        if pd.isna(v):
+            try:
+                v = pd.to_datetime(ts, dayfirst=True, errors='coerce')
+            except Exception:
+                v = pd.NaT
+        return v
+
+    items = []
+    if isinstance(resp_json, dict):
+        data_obj = resp_json.get('data')
+        if isinstance(data_obj, dict):
+            for key in ('column1', 'column2', 'column3', 'items', 'list', 'datas', 'result'):
+                if key in data_obj and isinstance(data_obj[key], list):
+                    items = data_obj[key]
+                    break
+        if not items:
+            for key in ('data', 'items', 'list', 'result', 'datas'):
+                if key in resp_json and isinstance(resp_json[key], list):
+                    items = resp_json[key]
+                    break
+
+    if not items:
+        return pd.DataFrame()
+
+    times, values = [], []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        t = it.get('time') or it.get('date') or it.get(
+            'collectTime') or it.get('cTime') or it.get('tm')
+        if column_name in it:
+            v = it.get(column_name)
+        else:
+            v = it.get('value') or it.get(
+                'v') or it.get('val') or it.get('column')
+        if t is None or v is None:
+            continue
+        t_parsed = _parse_time(t)
+        if pd.isna(t_parsed):
+            continue
+        try:
+            v_f = float(str(v).replace(',', '.'))
+        except Exception:
+            continue
+        times.append(t_parsed)
+        values.append(v_f)
+
+    if not times:
+        return pd.DataFrame()
+    return pd.DataFrame({'time': times, column_name: values}).dropna()
+
+
+def fetch_realtime_df(account: str, password: str, inverter_sn: str, req_date: date, columns: list[str],
+                      login_region: str = "us", data_region: str = "eu") -> pd.DataFrame:
+    """Executa crosslogin e busca várias colunas via GetInverterDataByColumn."""
+    token = crosslogin(account, password, login_region)
+    dt_str = datetime.combine(req_date, dtime(
+        0, 0)).strftime("%Y-%m-%d %H:%M:%S")
+    dfs = []
+    for col in columns:
+        try:
+            js = get_inverter_data_by_column(
+                token, inverter_sn, col, dt_str, data_region)
+            df_col = parse_column_timeseries(js, col)
+            if not df_col.empty:
+                dfs.append(df_col)
+            else:
+                st.warning(
+                    f"Não consegui parsear a coluna '{col}'. Veja JSON bruto abaixo.")
+                with st.expander(f"Ver resposta JSON ({col})"):
+                    st.code(json.dumps(js, ensure_ascii=False, indent=2))
+        except Exception as e:
+            st.error(f"Erro ao buscar coluna '{col}': {e}")
+    if not dfs:
+        return pd.DataFrame()
+    out = dfs[0]
+    for df_next in dfs[1:]:
+        out = pd.merge_asof(out.sort_values("time"), df_next.sort_values(
+            "time"), on="time", direction="nearest")
+    return out
+# ---------------------------- UI -----------------------------------
+# --- Configuração da Página e Estilos ---
+
+
+st.set_page_config(
+    page_title="GoodWe Smart Solar Home",
+    page_icon="🏠",
+    layout="wide"
+)
+
+# Estilo CSS para aplicar as cores: fundo branco e detalhes em vermelho
+# Streamlit gera classes específicas, então miramos nelas.
+st.markdown("""
+<style>
+    /* Cor principal para botões e detalhes */
+    :root {
+        --primary-color: #e53935; /* Vermelho */
+        --primary-color-dark: #c62828;
+    }
+
+    /* Botão de submissão do formulário */
+    .stButton > button {
+        background-color: var(--primary-color);
+        color: white;
+        border-radius: 5px;
+        border: none;
+        padding: 10px 20px;
+    }
+    .stButton > button:hover {
+        background-color: var(--primary-color-dark);
+        color: white;
+    }
+    
+    /* Cor da borda do título */
+    h1 {
+        border-bottom: 3px solid var(--primary-color);
+        padding-bottom: 10px;
+    }
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------- UI -----------------------------------
+st.set_page_config(page_title="GoodAccess",
+                   layout="wide", page_icon="🌞")
+st.title("🌞 GoodWe Assistant — MVP")
+st.caption("Streamlit starter • mock + modo real (SEMS) básico")
+
+with st.sidebar:
+    st.header("Configuração")
+    modo = st.selectbox(
+        "Modo de dados", ["Mock (recomendado para começar)", "Real (SEMS)"], index=0)
+    inverter_sn_input = st.text_input("Inverter SN", value="5010KETU229W6177")
+    data_ref = st.date_input("Data", value=date(2025, 8, 12))
+
+    if modo == "Real (SEMS)":
+        st.markdown("---")
+        st.subheader("Login SEMS")
+        env_acc = os.getenv("SEMS_ACCOUNT", "demo@goodwe.com")
+        env_pwd = os.getenv("SEMS_PASSWORD", "GoodweSems123!@#")
+        login_region = st.selectbox("Região de login", ["us", "eu"], index=0)
+        data_region = st.selectbox("Região de dados", ["eu", "us"], index=0)
+        account = st.text_input("SEMS_ACCOUNT (email)", value=env_acc)
+        password = st.text_input(
+            "SEMS_PASSWORD", value=env_pwd, type="password")
+        columns = st.multiselect("Colunas desejadas", ["Pac", "Eday", "Cbattery1", "Temp"],
+                                 default=["Pac", "Eday", "Cbattery1"])
+    else:
+        columns = ["Pac", "Eday", "Cbattery1"]
+        login_region = "us"
+        data_region = "eu"
+        account = ""
+        password = ""
+
+# ------------------ Carregar dados (Mock ou Real) ------------------
+if 'modo' not in locals():
+    modo = "Mock (recomendado para começar)"
+if modo == "Real (SEMS)":
+    df = fetch_realtime_df(
+        account=account,
+        password=password,
+        inverter_sn=inverter_sn_input,
+        req_date=data_ref,
+        columns=columns,
+        login_region=login_region,
+        data_region=data_region
+    )
+else:
+    df = carregar_mock(MOCK_PATH)
+
+# KPIs + gráficos
+if df is not None and not df.empty:
+    col1, col2, col3 = st.columns(3)
+    res = resumo_dia(df)
+    col1.metric("Energia do dia", kwh(res.get("energia_dia", 0.0)))
+    if res.get("hora_pico"):
+        col2.metric("Pico de potência", kw(res.get("pico_potencia", 0.0)),
+                    res["hora_pico"].strftime("%H:%M"))
+    else:
+        col2.metric("Pico de potência", "—")
+    soc_ini, soc_fim = res.get("soc_ini"), res.get("soc_fim")
+    soc_txt = f"{soc_ini}% → {soc_fim}%" if soc_ini is not None and soc_fim is not None else "—"
+    col3.metric("Bateria (início → fim)", soc_txt)
+
+    left, right = st.columns(2)
+    with left:
+        if "Pac" in df.columns:
+            fig_p = px.line(df, x="time", y="Pac", markers=True,
+                            title="Potência (Pac) ao longo do dia")
+            fig_p.update_layout(margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig_p, use_container_width=True)
+        else:
+            st.info("Sem coluna 'Pac' para plotar.")
+    with right:
+        if "Cbattery1" in df.columns:
+            fig_soc = px.line(df, x="time", y="Cbattery1", markers=True,
+                              title="Estado de Carga da Bateria (SOC %)")
+            fig_soc.update_layout(margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig_soc, use_container_width=True)
+        else:
+            st.info("Sem coluna 'Cbattery1' para plotar.")
+
+    with st.expander("Ver tabela de dados"):
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "Baixar CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=f"goodwe_{inverter_sn_input}_{data_ref}.csv",
+        mime="text/csv"
+    )
+
+# ---------------- Dispositivos da Casa (Simulação) ----------------
+st.header("📟 Dispositivos da Casa")
+
+if "devices" not in st.session_state:
+    st.session_state.devices = {
+        "base01": {"id": "base01", "name": "Consumo Base", "state": "on", "consumption_kw": 0.3}
+    }
+
+with st.form("add_device_form"):
+    st.subheader("Adicionar novo dispositivo")
+    name = st.text_input("Nome do dispositivo")
+    consumption = st.number_input("Consumo (kW)", min_value=0.0, step=0.1)
+    submitted = st.form_submit_button("Adicionar")
+    if submitted:
+        import uuid
+        if name and consumption > 0:
+            device_id = str(uuid.uuid4())
+            st.session_state.devices[device_id] = {
+                "id": device_id,
+                "name": name,
+                "state": "off",
+                "consumption_kw": consumption
+            }
+            st.success(f"✅ Dispositivo '{name}' adicionado!")
+        else:
+            st.warning("Preencha o nome e consumo corretamente.")
+
+st.subheader("Lista de dispositivos")
+for dev_id, dev in list(st.session_state.devices.items()):
+    col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+    col1.write(f"**{dev['name']}** — {dev['consumption_kw']} kW")
+    col2.write("🟢 Ligado" if dev["state"] == "on" else "⚪ Desligado")
+
+    if col3.button("Ligar" if dev["state"] == "off" else "Desligar", key=f"toggle_{dev_id}"):
+        st.session_state.devices[dev_id]["state"] = "on" if dev["state"] == "off" else "off"
+
+    if col4.button("❌ Remover", key=f"del_{dev_id}"):
+        del st.session_state.devices[dev_id]
+        st.rerun()
+
+total_consumo_devices = sum(
+    dev["consumption_kw"] for dev in st.session_state.devices.values() if dev["state"] == "on"
+)
+st.metric("Consumo total de dispositivos", f"{total_consumo_devices:.2f} kW")
+
+st.markdown("---")
+st.markdown("---")
+
+# Caixa de texto para o usuário digitar a pergunta
+mensagem_usuario = st.text_area(
+    "Digite sua pergunta ou análise sobre o dia", height=100)
+
+# Botão de enviar
+if st.button("Enviar"):
+    if mensagem_usuario.strip() == "":
+        st.warning("Digite alguma mensagem antes de enviar.")
+    else:
+        # Pega os dados do dia
+        res_info = resumo_dia(df)
+        # Chama a IA passando os dados + pergunta do usuário
+        resposta_ia = explicar_dia(res_info, pergunta=mensagem_usuario)
+        # Mostra a resposta
+        st.info(resposta_ia)
+
+# ------------------ Dispositivos da casa ------------------
+if "devices" not in st.session_state:
+    st.session_state.devices = {
+        "base01": {"id": "base01", "name": "Consumo Base", "state": "on", "consumption_kw": 0.3},
+        "lamp01": {"id": "lamp01", "name": "Lâmpada Sala", "state": "off", "consumption_kw": 0.1},
+        "tv01": {"id": "tv01", "name": "TV", "state": "on", "consumption_kw": 0.2},
+    }
+
+
+def calcular_consumo_total():
+    return sum(
+        dev["consumption_kw"] for dev in st.session_state.devices.values() if dev["state"] == "on"
+    )
+
+
+# ---------------- Detecta se é mobile ----------------
+if "is_mobile" not in st.session_state:
+    st.session_state.is_mobile = None
+
+if st.session_state.is_mobile is None:
+    html("""
+    <script>
+    function detectMobile() {
+        const ua = navigator.userAgent || navigator.vendor || window.opera;
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(ua);
+        window.parent.postMessage({funcName: "setMobile", isMobile: isMobile}, "*");
+    }
+    detectMobile();
+    </script>
+    """, height=0)
+    st.session_state.is_mobile = False
+
+st.session_state.is_mobile = streamlit_js_eval(
+    js_expressions="(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent))"
+)
+
+# ---------------- Visualização AR ----------------
+st.subheader("📷 Visualização AR da Casa")
+
+
+def gerar_ar_html(facing_mode: str, consumo_total: float) -> str:
+    return f"""
+    <div style="position:relative; width:100%; height:400px;">
+        <video id="video" autoplay playsinline style="width:100%; height:100%; object-fit:cover;"></video>
+        <div style="
+            position:absolute;
+            top:10px;
+            left:10px;
+            font-size:20px;
+            color:white;
+            background-color:rgba(0,0,0,0.5);
+            padding:5px;
+            border-radius:5px;">
+            Total consumo: {consumo_total:.2f} kW
+        </div>
+    </div>
+    <script>
+    async function initCamera() {{
+        try {{
+            const stream = await navigator.mediaDevices.getUserMedia({{ video: {{ facingMode: "{facing_mode}" }} }});
+            document.getElementById('video').srcObject = stream;
+        }} catch(e) {{
+            console.log("Erro ao acessar câmera:", e);
+        }}
+    }}
+    initCamera();
+    </script>
+    """
+
+
+if st.session_state.is_mobile:
+    facing = st.radio("Escolha câmera", ["Traseira", "Frontal"])
+    facing_mode = "environment" if facing == "Traseira" else "user"
+    html(gerar_ar_html(facing_mode, calcular_consumo_total()), height=400)
+else:
+    st.warning(
+        "⚠ AR só pode ser usado em dispositivos Mobile. A câmera não será ativada no desktop.")
