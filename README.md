@@ -10,6 +10,8 @@ Lucas Mendes Moraes
 
 Pedro Noronha dos Santos
 
+Rodrigo Campos Cordeiro
+
 GoodWe Assistant - Análise de Energia Solar com Streamlit
 Este é o README do projeto "GoodWe Assistant", uma aplicação web desenvolvida em Python com a biblioteca Streamlit. A aplicação permite visualizar e analisar dados de geração de energia de um inversor solar da GoodWe, integrando simulação de automação residencial, um assistente com Inteligência Artificial e visualização em Realidade Aumentada.
 
