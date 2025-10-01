@@ -3,6 +3,7 @@
 # FIAP x GoodWe – Starter (Streamlit + mock SEMS data) - v2
 # Inclui modo "Real (SEMS)" usando demo@goodwe.com / GoodweSems123!@#
 # -------------------------------------------------------------------
+import google.generativeai as genai
 import os
 import json
 from pathlib import Path
@@ -13,10 +14,10 @@ from streamlit_js_eval import streamlit_js_eval
 import pandas as pd
 import plotly.express as px
 from threading import Thread
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY", "AIzaSyBt9XBhyz0TvMlfVYw70cpBWD1mdU72FvI"))
 
 
 # Módulos locais
-from ai_openai import explicar_dia
 from goodwe_client import crosslogin, get_inverter_data_by_column
 
 # Caminhos
@@ -165,13 +166,13 @@ def fetch_realtime_df(account: str, password: str, inverter_sn: str, req_date: d
         out = pd.merge_asof(out.sort_values("time"), df_next.sort_values(
             "time"), on="time", direction="nearest")
     return out
-# ---------------------------- UI -----------------------------------
+# ----------------------------------- UI -----------------------------------
 # --- Configuração da Página e Estilos ---
 
 
 st.set_page_config(
-    page_title="GoodWe Smart Solar Home",
-    page_icon="🏠",
+    page_title="Assistente GoodAcess",
+    page_icon="🌞",
     layout="wide"
 )
 
@@ -211,13 +212,13 @@ st.markdown("""
 # ---------------------------- UI -----------------------------------
 st.set_page_config(page_title="GoodAccess",
                    layout="wide", page_icon="🌞")
-st.title("🌞 GoodWe Assistant — MVP")
+st.title("🌞 GoodAcess")
 st.caption("Streamlit starter • mock + modo real (SEMS) básico")
 
 with st.sidebar:
     st.header("Configuração")
     modo = st.selectbox(
-        "Modo de dados", ["Mock (recomendado para começar)", "Real (SEMS)"], index=0)
+        "Modo de dados", ["Mock (Dados para simulação)", "Real (SEMS)"], index=0)
     inverter_sn_input = st.text_input("Inverter SN", value="5010KETU229W6177")
     data_ref = st.date_input("Data", value=date(2025, 8, 12))
 
@@ -228,9 +229,9 @@ with st.sidebar:
         env_pwd = os.getenv("SEMS_PASSWORD", "GoodweSems123!@#")
         login_region = st.selectbox("Região de login", ["us", "eu"], index=0)
         data_region = st.selectbox("Região de dados", ["eu", "us"], index=0)
-        account = st.text_input("SEMS_ACCOUNT (email)", value=env_acc)
+        account = st.text_input("Conta SEMS (email)", value=env_acc)
         password = st.text_input(
-            "SEMS_PASSWORD", value=env_pwd, type="password")
+            "Senha", value=env_pwd, type="password")
         columns = st.multiselect("Colunas desejadas", ["Pac", "Eday", "Cbattery1", "Temp"],
                                  default=["Pac", "Eday", "Cbattery1"])
     else:
@@ -298,8 +299,8 @@ if df is not None and not df.empty:
         mime="text/csv"
     )
 
-# ---------------- Dispositivos da Casa (Simulação) ----------------
-st.header("📟 Dispositivos da Casa")
+# ---------------- Dispositivos Conectados(Simulação) ----------------
+st.header("Dispositivos Conectados")
 
 if "devices" not in st.session_state:
     st.session_state.devices = {
@@ -345,24 +346,85 @@ st.metric("Consumo total de dispositivos", f"{total_consumo_devices:.2f} kW")
 
 st.markdown("---")
 st.markdown("---")
+st.markdown("---")
+st.title("Assistente GIA")
 
-# Caixa de texto para o usuário digitar a pergunta
-mensagem_usuario = st.text_area(
-    "Digite sua pergunta ou análise sobre o dia", height=100)
+# --- CORREÇÃO: INICIALIZAR O SESSION STATE ---
+# Inicializa as variáveis no session_state para evitar erros na primeira execução.
+if 'pergunta_usuario' not in st.session_state:
+    st.session_state.pergunta_usuario = ""
+if 'resposta_ia' not in st.session_state:
+    st.session_state.resposta_ia = ""
 
-# Botão de enviar
-if st.button("Enviar"):
-    if mensagem_usuario.strip() == "":
-        st.warning("Digite alguma mensagem antes de enviar.")
+# Função para gerar resposta
+def explicar_dados_solares(dados_solares, pergunta_usuario):
+    prompt = f"""
+Você é um assistente especializado em energia solar.
+Analise os seguintes dados de um dia de geração solar:
+
+{dados_solares}
+
+Com base nesses dados, responda à pergunta do usuário:
+"{pergunta_usuario}"
+
+Responda de forma clara, objetiva e didática.
+"""
+    modelo = genai.GenerativeModel("gemini-1.5-flash")
+    resposta = modelo.generate_content(prompt)
+    return resposta.text
+
+
+# --- CORREÇÃO: USAR UMA "key" NO WIDGET ---
+# A 'key' vincula o conteúdo deste widget ao st.session_state
+st.text_area(
+    "Pergunte à GoodIA (GIA):",
+    key="pergunta_usuario"
+)
+
+# Botão de envio
+if st.button("Perguntar"):
+    if st.session_state.pergunta_usuario.strip() == "":
+        st.warning("Por favor, digite uma pergunta para a IA analisar.")
+        st.session_state.resposta_ia = "" 
     else:
-        # Pega os dados do dia
-        res_info = resumo_dia(df)
-        # Chama a IA passando os dados + pergunta do usuário
-        resposta_ia = explicar_dia(res_info, pergunta=mensagem_usuario)
-        # Mostra a resposta
-        st.info(resposta_ia)
+        # Constrói a string 'dados_solares' dinamicamente com os dados carregados.
+        data_str = data_ref.strftime('%d/%m/%Y')
+        energia_str = kwh(res.get("energia_dia", 0.0))
+        pico_potencia_str = kw(res.get("pico_potencia", 0.0))
+        hora_pico_str = res["hora_pico"].strftime("%H:%M") if res.get("hora_pico") else "N/A"
+        soc_ini = res.get('soc_ini', 'N/A')
+        soc_fim = res.get('soc_fim', 'N/A')
+        soc_str = f"{soc_ini}% no início e {soc_fim}% no final do período."
 
-# ------------------ Dispositivos da casa ------------------
+        resumo_para_ia = [
+            f"- Data da Análise: {data_str}",
+            f"- Energia Total Gerada no Dia: {energia_str}",
+            f"- Pico de Potência de Geração: {pico_potencia_str} (atingido às {hora_pico_str})",
+            f"- Estado da Bateria (SOC): {soc_str}"
+        ]
+
+        if 'Temp' in df.columns and not df['Temp'].dropna().empty:
+            temp_media = df['Temp'].mean()
+            resumo_para_ia.append(f"- Temperatura Média do Inversor: {temp_media:.1f}°C")
+
+        dados_solares = "\n".join(resumo_para_ia)
+        
+        # Chama a IA e salva a resposta no session_state
+        with st.spinner("Formulando resposta..."):
+            # --- CORREÇÃO: SALVAR A RESPOSTA NO SESSION STATE ---
+            st.session_state.resposta_ia = explicar_dados_solares(
+                dados_solares, 
+                st.session_state.pergunta_usuario
+            )
+
+# --- CORREÇÃO: EXIBIR A RESPOSTA A PARTIR DO SESSION STATE ---
+# Este bloco fica fora do 'if st.button', para que a resposta seja exibida mesmo após o rerun.
+if st.session_state.resposta_ia:
+    st.markdown("---")
+    st.markdown("##### Resposta da IA:")
+    st.write(st.session_state.resposta_ia)
+    
+# ------------------ Dispositivos Conectados ------------------
 if "devices" not in st.session_state:
     st.session_state.devices = {
         "base01": {"id": "base01", "name": "Consumo Base", "state": "on", "consumption_kw": 0.3},
@@ -399,7 +461,7 @@ st.session_state.is_mobile = streamlit_js_eval(
 )
 
 # ---------------- Visualização AR ----------------
-st.subheader("📷 Visualização AR da Casa")
+st.subheader("Visualização com Realidade Aumentada")
 
 
 def gerar_ar_html(facing_mode: str, consumo_total: float) -> str:
